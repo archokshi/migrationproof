@@ -1,0 +1,11 @@
+{
+  "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+  "device": "cuda",
+  "batch_size": 8,
+  "max_length": 256,
+  "precision": "float32",
+  "pooling": "attention_mask_mean",
+  "normalize": true,
+  "api_fields": ["query", "document_ids", "scores"],
+  "hardware_validated": false
+}

@@ -1,0 +1,273 @@
+{
+  "id": "878192f5-cec6-4bdf-ade8-5c627eb06de4",
+  "model": "gemini-4-argon",
+  "agent": "antigravity-preview-09-2026",
+  "batchSize": 16,
+  "status": "prepared",
+  "phase": "verify",
+  "startedAt": "2026-10-25T21:39:07.559Z",
+  "completedAt": "2026-10-25T21:41:01.261Z",
+  "hardwareValidated": false,
+  "artifacts": {
+    "encoder.py": "\"\"\"SupportSearch reference CUDA worker. Hardware execution is not part of the local demo.\"\"\"\nimport torch\nimport torch_tpu\nimport torch.nn.functional as F\nfrom transformers import AutoModel, AutoTokenizer\n\nMODEL_ID = \"sentence-transformers/all-MiniLM-L6-v2\"\nDEVICE = \"tpu\"\nBATCH_SIZE = 16\nMAX_LENGTH = 256\n\ndef mean_pool(hidden, attention_mask):\n    mask = attention_mask.unsqueeze(-1).expand(hidden.size()).float()\n    return (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)\n\ndef normalize_vectors(vectors):\n    return F.normalize(vectors, p=2, dim=1)\n\ndef encode(texts):\n    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)\n    model = AutoModel.from_pretrained(MODEL_ID).to(DEVICE).eval()\n    outputs = []\n    with torch.inference_mode():\n        for start in range(0, len(texts), BATCH_SIZE):\n            batch = texts[start:start + BATCH_SIZE]\n            tokens = tokenizer(batch, padding=\"max_length\", truncation=True,\n                               max_length=MAX_LENGTH, return_tensors=\"pt\")\n            tokens = {key: value.to(DEVICE) for key, value in tokens.items()}\n            hidden = model(**tokens).last_hidden_state\n            outputs.append(normalize_vectors(mean_pool(hidden, tokens[\"attention_mask\"])).cpu())\n    return torch.cat(outputs).tolist() if outputs else []\n",
+    "runtime.json": "{\n  \"model_id\": \"sentence-transformers/all-MiniLM-L6-v2\",\n  \"device\": \"tpu\",\n  \"batch_size\": 16,\n  \"max_length\": 256,\n  \"precision\": \"float32\",\n  \"pooling\": \"attention_mask_mean\",\n  \"normalize\": true,\n  \"api_fields\": [\"query\", \"document_ids\", \"scores\"],\n  \"hardware_validated\": false\n}\n",
+    "migration.md": "# SupportSearch TorchTPU Hardware Trial Migration Guide\n\n## 1. Summary of Changes\n\nThis constrained migration prepares the legacy SupportSearch CUDA embedding worker (`legacy/encoder.py` and `legacy/runtime.json`) for a hardware trial on Google Cloud TPU using `torch_tpu` ([google-pytorch/torch_tpu](https://github.com/google-pytorch/torch_tpu), [Hugging Face Transformers Google TPU guide](https://huggingface.co/docs/transformers/main/google_tpu)). No accelerator was available in the preparation environment; these artifacts have **not** been executed on TPU or GPU hardware, and no deployment or measured numerical/performance parity is claimed.\n\n### `candidate/encoder.py`\n- **Backend registration**: Added a standalone `import torch_tpu` statement so the `tpu` device backend is registered with PyTorch at import time.\n- **Target device**: Changed `DEVICE` from `\"cuda\"` to `\"tpu\"`.\n- **Batch size**: Changed `BATCH_SIZE` from `8` to `16`.\n- **Preserved AST & behavior**: The module docstring, `MODEL_ID` (`\"sentence-transformers/all-MiniLM-L6-v2\"`), `MAX_LENGTH` (`256`), `mean_pool(hidden, attention_mask)`, `normalize_vectors(vectors)`, `encode(texts)` signature and body, tokenizer invocation (`padding=\"max_length\"`, `truncation=True`, `max_length=MAX_LENGTH`, `return_tensors=\"pt\"`), `float32` precision (via `.float()` in pooling and default `float32` weights), L2 normalization (`F.normalize(vectors, p=2, dim=1)`), and `.cpu()` transfer per batch are preserved identically without adding extra code.\n\n### `candidate/runtime.json`\n- Changed `\"device\"` from `\"cuda\"` to `\"tpu\"`.\n- Changed `\"batch_size\"` from `8` to `16`.\n- All other fields (`\"model_id\"`, `\"max_length\": 256`, `\"precision\": \"float32\"`, `\"pooling\": \"attention_mask_mean\"`, `\"normalize\": true`, `\"api_fields\": [\"query\", \"document_ids\", \"scores\"]`, and `\"hardware_validated\": false`) are unchanged.\n\n---\n\n## 2. Limitations and Unverified Assumptions\n\nBecause this migration is strictly constrained in AST structure and prepared without TPU hardware access, the following limitations and assumptions remain unverified until tested on a physical Cloud TPU host:\n\n1. **Operator Coverage & Lowering**:\n   - All operators inside `sentence-transformers/all-MiniLM-L6-v2` (BERT-based self-attention, `LayerNorm`, `GELU`, linear projections, embeddings), `mean_pool` (`unsqueeze`, `expand`, `.float()`, elementwise multiplication, `.sum(1)`, `.clamp(min=1e-9)`, division), and `normalize_vectors` (`F.normalize(..., p=2, dim=1)`) are assumed to lower cleanly through the `torch_tpu` / XLA compiler without silent CPU fallback or unsupported-op exceptions.\n2. **Per-Call Model & Tokenizer Instantiation**:\n   - Because `encode(texts)` preserves the exact legacy AST, `AutoTokenizer.from_pretrained(MODEL_ID)` and `AutoModel.from_pretrained(MODEL_ID).to(DEVICE).eval()` are called inside `encode(texts)` on every invocation, and `.cpu()` is called after each batch iteration forcing host-device synchronization per step.\n3. **Float32 Precision on TPU MXU**:\n   - The configuration preserves `\"precision\": \"float32\"` and explicit `.float()` casting in `mean_pool`. TPU Matrix Multiply Units (MXUs) natively accelerate `bfloat16` / mixed-precision formats and configurable matmul precision settings; running strict `float32` vs. default XLA matmul precision may exhibit slight numerical differences compared to CUDA `float32` (or TF32) and requires explicit numerical tolerance verification on hardware.\n4. **Hardware Validation Status**:\n   - `\"hardware_validated\"` remains `false` in `candidate/runtime.json` and must only be flipped after passing all hardware verification checks below.\n\n---\n\n## 3. Static Shapes and Partial-Batch Handling\n\n- **Sequence dimension (`MAX_LENGTH = 256`)**: The tokenizer uses `padding=\"max_length\"` and `truncation=True` with `max_length=256`, which fixes the sequence length dimension at `256` across all calls.\n- **Batch dimension (`BATCH_SIZE = 16`) and Partial Final Batch**:\n  - Full batches produce input tensors (`input_ids`, `attention_mask`, `token_type_ids`) of static shape `(16, 256)`.\n  - However, the batching loop `batch = texts[start:start + BATCH_SIZE]` slices the trailing remainder directly when `len(texts)` is not an exact multiple of `16` (i.e., `len(texts) % 16 != 0`).\n  - **XLA Recompilation Risk**: On TPU (`torch_tpu`), XLA compiles graphs specialized to exact input tensor dimensions. A trailing partial batch of size $R \\in \\{1, \\dots, 15\\}$ produces tensor shapes `(R, 256)`, triggering a new XLA graph compilation for each distinct remainder $R$ encountered in traffic (up to 15 additional compilations beyond the `(16, 256)` graph), causing latency spikes on first occurrence.\n  - **Mitigation & Operational Guidance**:\n    - Because the constrained migration prohibits altering the `encode(texts)` AST, callers or the upstream request batcher should either pad input text lists to a multiple of `16` (and slice the returned list back to `len(texts)`) or pre-warm the worker across expected batch sizes `(1..16, 256)` during startup before serving live queries.\n    - In a subsequent unconstrained iteration, `encode(texts)` can pad partial batches internally to `BATCH_SIZE = 16` with dummy inputs prior to device transfer and slice `outputs` to the unpadded count after `.cpu()`.\n\n---\n\n## 4. Model Revision and Tokenizer Pinning\n\n- **Current Risk**: `MODEL_ID = \"sentence-transformers/all-MiniLM-L6-v2\"` is resolved dynamically from the Hugging Face Hub (or local cache) without an explicit `revision=<commit_sha>` or `local_files_only=True` argument because the AST is constrained. If upstream weights, `config.json`, or tokenizer files (`tokenizer.json`, `vocab.txt`, `special_tokens_map.json`) change on the Hub, workers could produce incompatible embeddings across nodes or restarts.\n- **Pinning Procedure for the Trial**:\n  1. Pre-download and verify a specific immutable Git commit SHA of `sentence-transformers/all-MiniLM-L6-v2` into a read-only artifact image or local mount prior to starting the TPU worker.\n  2. Set environment variables on the worker host so `transformers` resolves purely from the pinned local snapshot:\n     ```bash\n     export HF_HUB_OFFLINE=1\n     export TRANSFORMERS_OFFLINE=1\n     export HF_HOME=/opt/models/hf_cache\n     ```\n  3. Record the exact model commit SHA, `transformers` version, `tokenizers` version, `torch` version, and `torch_tpu` wheel digest in the deployment manifest.\n\n---\n\n## 5. Prerequisites for the TPU Hardware Trial\n\n1. **Hardware & OS**:\n   - A provisioned Google Cloud TPU VM (e.g., TPU v5e / v5p / v6e single-chip or single-host slice) running Ubuntu 22.04/24.04 with matching `libtpu.so` driver installed and accessible TPU device nodes (`/dev/accel*` or `/dev/vfio/*`).\n2. **Software Stack**:\n   - Compatible Python (`>=3.10`), `torch`, `torch_tpu` (matching the installed PyTorch and `libtpu` release from [google-pytorch/torch_tpu](https://github.com/google-pytorch/torch_tpu)), and `transformers` ([Hugging Face Google TPU documentation](https://huggingface.co/docs/transformers/main/google_tpu)).\n3. **Model Artifacts**:\n   - Local cached copy of `sentence-transformers/all-MiniLM-L6-v2` (weights + tokenizer files) matching the pinned revision used by the CUDA baseline.\n4. **Reference Baseline Artifact**:\n   - A saved reference output file (`cuda_baseline_embeddings.pt` or `.json`) generated by running `legacy/encoder.py` on CUDA with a fixed evaluation corpus covering empty inputs (`0`), single partial batch (`1`, `7`, `15`), exact single batch (`16`), exact multiple batches (`32`), and multi-batch with remainder (`35`), plus long inputs exceeding `256` tokens to exercise truncation.\n\n---\n\n## 6. Exact Checks to Run on Real Hardware\n\nRun the following verification steps sequentially on the target TPU VM before routing any trial traffic:\n\n### Check 1: TPU Device & `torch_tpu` Backend Registration\n```bash\npython3 -c '\nimport torch\nimport torch_tpu\n\nassert hasattr(torch, \"tpu\"), \"torch.tpu namespace not registered\"\nassert torch.tpu.is_available(), \"TPU device is not available\"\nprint(\"TPU device count:\", torch.tpu.device_count())\nx = torch.ones((2, 2), device=\"tpu\", dtype=torch.float32)\nprint(\"Simple tensor op on TPU succeeded:\", (x + x).cpu().tolist())\n'\n```\n\n### Check 2: Candidate Functional Smoke & Shape/Normalization Check\n```bash\npython3 -c '\nimport math\nfrom candidate.encoder import encode, BATCH_SIZE\n\n# 1. Empty input check\nassert encode([]) == [], \"Empty input must return []\"\n\n# 2. Exact batch (16) and partial batch (19 = 16 + 3) check\ntexts = [f\"Support ticket #{i}: unable to reset account MFA token.\" for i in range(19)]\nvecs = encode(texts)\nassert len(vecs) == 19, f\"Expected 19 vectors, got {len(vecs)}\"\nassert all(len(v) == 384 for v in vecs), \"Expected 384-d embeddings for all-MiniLM-L6-v2\"\n\n# 3. Finite values and unit L2 norm check\nfor idx, v in enumerate(vecs):\n    assert all(math.isfinite(x) for x in v), f\"Non-finite value in vector {idx}\"\n    norm = math.sqrt(sum(x * x for x in v))\n    assert abs(norm - 1.0) < 1e-5, f\"Vector {idx} L2 norm {norm} deviates from 1.0\"\nprint(\"Functional smoke and L2 normalization checks passed.\")\n'\n```\n\n### Check 3: Batch-Size Invariance & Partial-Batch Consistency Check\nVerify that encoding a text inside a full batch of `16` produces the same embedding as encoding it in a partial trailing batch:\n```bash\npython3 -c '\nimport torch\nfrom candidate.encoder import encode\n\ntexts_full = [f\"Sample query {i}\" for i in range(16)]\ntexts_partial = texts_full[:5]\n\nemb_full = torch.tensor(encode(texts_full)[:5], dtype=torch.float32)\nemb_partial = torch.tensor(encode(texts_partial), dtype=torch.float32)\n\ncos_sim = torch.nn.functional.cosine_similarity(emb_full, emb_partial, dim=1)\nmax_abs_diff = (emb_full - emb_partial).abs().max().item()\nprint(\"Min cosine similarity (full vs partial):\", cos_sim.min().item())\nprint(\"Max abs diff (full vs partial):\", max_abs_diff)\nassert cos_sim.min().item() > 0.99999, \"Partial batch output diverged from full batch\"\n'\n```\n\n### Check 4: Numerical Parity Against CUDA Baseline\nCompare `candidate/encoder.py` on TPU against pre-recorded CUDA baseline embeddings on the validation corpus:\n```bash\npython3 -c '\nimport json, torch\nfrom candidate.encoder import encode\n\nwith open(\"cuda_baseline_fixture.json\", \"r\", encoding=\"utf-8\") as f:\n    fixture = json.load(f)\n\ntpu_out = torch.tensor(encode(fixture[\"texts\"]), dtype=torch.float32)\ncuda_out = torch.tensor(fixture[\"embeddings\"], dtype=torch.float32)\n\ncos_sim = torch.nn.functional.cosine_similarity(tpu_out, cuda_out, dim=1)\nmax_diff = (tpu_out - cuda_out).abs().max().item()\nprint(f\"Min cosine similarity vs CUDA: {cos_sim.min().item():.6f}\")\nprint(f\"Max absolute error vs CUDA:    {max_diff:.6e}\")\nassert cos_sim.min().item() >= 0.999, \"Cosine similarity below 0.999 threshold\"\n'\n```\n\n### Check 5: Warmup vs. Steady-State Latency & Recompilation Inspection\nMeasure initial compilation latency vs. subsequent warm invocations for `N=16` (static full batch) and `N=19` (with partial tail batch):\n```bash\npython3 -c '\nimport time\nfrom candidate.encoder import encode\n\nbatch_16 = [f\"Warmup text {i}\" for i in range(16)]\nt0 = time.perf_counter(); encode(batch_16); t_cold = time.perf_counter() - t0\nt1 = time.perf_counter(); encode(batch_16); t_warm = time.perf_counter() - t1\nprint(f\"N=16 cold_s={t_cold:.4f} warm_s={t_warm:.4f}\")\n'\n```\n\n---\n\n## 7. Rollout and Rollback Plan\n\n### Rollout Plan\n1. **Stage 1 \u2014 Offline Hardware Validation**: Run Checks 1\u20135 on a dedicated staging TPU VM. Only after all checks pass, update `\"hardware_validated\": true` in deployment metadata.\n2. **Stage 2 \u2014 Shadow / Dark-Traffic Trial**: Deploy the TPU worker behind a shadow queue receiving duplicated read-only production queries (`api_fields`: `[\"query\", \"document_ids\", \"scores\"]`). Compare TPU vs. CUDA top-$k$ retrieval overlap (Recall@10 / rank correlation) and tail latency (p50/p95/p99), watching specifically for XLA recompilation spikes on partial batches.\n3. **Stage 3 \u2014 Canary Traffic Ramp**: Route 1% $\\rightarrow$ 10% $\\rightarrow$ 50% $\\rightarrow$ 100% of stateless embedding worker traffic to the TPU worker pool while keeping the CUDA worker pool warm on standby.\n\n### Rollback Plan\n- Because `encode(texts)` signature, `MODEL_ID`, `MAX_LENGTH`, embedding dimension (`384`), normalization, and `api_fields` (`[\"query\", \"document_ids\", \"scores\"]`) are identical between `legacy/` and `candidate/`, rollback requires **zero index rebuilds or API schema changes**.\n- **Immediate Rollback Trigger Conditions**:\n  - Any unhandled XLA/TPU runtime error or device hang,\n  - Cosine similarity drift (`< 0.999` vs. CUDA baseline) or retrieval Recall@10 degradation,\n  - Unacceptable p99 latency spikes caused by partial-batch recompilation or per-call model loading.\n- **Rollback Execution**:\n  1. Shift traffic routing weight back to `100%` on the legacy CUDA worker pool (`legacy/encoder.py` + `legacy/runtime.json` with `\"device\": \"cuda\"`, `\"batch_size\": 8`).\n  2. Drain and terminate the candidate TPU worker instances, preserving XLA compile logs and failure payloads for offline diagnosis.\n"
+  },
+  "checks": [
+    {
+      "name": "Runtime contract: model_id",
+      "passed": true
+    },
+    {
+      "name": "Runtime contract: device",
+      "passed": true
+    },
+    {
+      "name": "Runtime contract: batch_size",
+      "passed": true
+    },
+    {
+      "name": "Runtime contract: max_length",
+      "passed": true
+    },
+    {
+      "name": "Runtime contract: precision",
+      "passed": true
+    },
+    {
+      "name": "Runtime contract: pooling",
+      "passed": true
+    },
+    {
+      "name": "Runtime contract: normalize",
+      "passed": true
+    },
+    {
+      "name": "Runtime contract: api_fields",
+      "passed": true
+    },
+    {
+      "name": "Runtime contract: hardware_validated",
+      "passed": true
+    },
+    {
+      "name": "Python syntax parses",
+      "passed": true
+    },
+    {
+      "name": "mean_pool AST preserved",
+      "passed": true
+    },
+    {
+      "name": "normalize_vectors AST preserved",
+      "passed": true
+    },
+    {
+      "name": "Model identity preserved in code",
+      "passed": true
+    },
+    {
+      "name": "TPU device configured in code",
+      "passed": true
+    },
+    {
+      "name": "Requested batch size in code",
+      "passed": true
+    },
+    {
+      "name": "Token length preserved in code",
+      "passed": true
+    },
+    {
+      "name": "TorchTPU backend imported",
+      "passed": true
+    },
+    {
+      "name": "Only approved source transformations",
+      "passed": true
+    }
+  ],
+  "provenance": {
+    "kind": "recorded-real-agent-run",
+    "sanitized": true,
+    "note": "Original artifact contents, hashes, checks and event timestamps retained. Remote interaction/environment identifiers replaced; prompts and response summaries omitted."
+  },
+  "events": [
+    {
+      "at": "2026-10-25T21:39:07.559Z",
+      "type": "created",
+      "message": "Real Argon preparation queued. Hardware execution remains pending."
+    },
+    {
+      "at": "2026-10-25T21:39:07.574Z",
+      "type": "request",
+      "message": "Uploading the CUDA worker and frozen contract to Managed Agent",
+      "attempt": 1
+    },
+    {
+      "at": "2026-10-25T21:39:15.438Z",
+      "type": "started",
+      "message": "Managed Agent is working in its remote environment"
+    },
+    {
+      "at": "2026-10-25T21:40:54.824Z",
+      "type": "tool",
+      "message": "list dir"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "tool",
+      "message": "list dir"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "tool",
+      "message": "list dir"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "tool",
+      "message": "view file"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "tool",
+      "message": "view file"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "tool",
+      "message": "view file"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "tool",
+      "message": "write to file"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "tool",
+      "message": "write to file"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "tool",
+      "message": "write to file"
+    },
+    {
+      "at": "2026-10-25T21:40:54.825Z",
+      "type": "response",
+      "message": "Managed Agent returned: completed"
+    },
+    {
+      "at": "2026-10-25T21:41:00.532Z",
+      "type": "artifact",
+      "message": "Downloaded the actual TPU candidate, runtime config and migration plan"
+    },
+    {
+      "at": "2026-10-25T21:41:01.241Z",
+      "type": "verification",
+      "message": "18/18 independent source-contract checks passed",
+      "failed": []
+    },
+    {
+      "at": "2026-10-25T21:41:01.261Z",
+      "type": "complete",
+      "message": "Candidate prepared. Release blocked pending GPU/TPU execution and quality measurements."
+    }
+  ],
+  "attempts": [
+    {
+      "number": 1,
+      "artifacts": {
+        "encoder.py": "\"\"\"SupportSearch reference CUDA worker. Hardware execution is not part of the local demo.\"\"\"\nimport torch\nimport torch_tpu\nimport torch.nn.functional as F\nfrom transformers import AutoModel, AutoTokenizer\n\nMODEL_ID = \"sentence-transformers/all-MiniLM-L6-v2\"\nDEVICE = \"tpu\"\nBATCH_SIZE = 16\nMAX_LENGTH = 256\n\ndef mean_pool(hidden, attention_mask):\n    mask = attention_mask.unsqueeze(-1).expand(hidden.size()).float()\n    return (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)\n\ndef normalize_vectors(vectors):\n    return F.normalize(vectors, p=2, dim=1)\n\ndef encode(texts):\n    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)\n    model = AutoModel.from_pretrained(MODEL_ID).to(DEVICE).eval()\n    outputs = []\n    with torch.inference_mode():\n        for start in range(0, len(texts), BATCH_SIZE):\n            batch = texts[start:start + BATCH_SIZE]\n            tokens = tokenizer(batch, padding=\"max_length\", truncation=True,\n                               max_length=MAX_LENGTH, return_tensors=\"pt\")\n            tokens = {key: value.to(DEVICE) for key, value in tokens.items()}\n            hidden = model(**tokens).last_hidden_state\n            outputs.append(normalize_vectors(mean_pool(hidden, tokens[\"attention_mask\"])).cpu())\n    return torch.cat(outputs).tolist() if outputs else []\n",
+        "runtime.json": "{\n  \"model_id\": \"sentence-transformers/all-MiniLM-L6-v2\",\n  \"device\": \"tpu\",\n  \"batch_size\": 16,\n  \"max_length\": 256,\n  \"precision\": \"float32\",\n  \"pooling\": \"attention_mask_mean\",\n  \"normalize\": true,\n  \"api_fields\": [\"query\", \"document_ids\", \"scores\"],\n  \"hardware_validated\": false\n}\n",
+        "migration.md": "# SupportSearch TorchTPU Hardware Trial Migration Guide\n\n## 1. Summary of Changes\n\nThis constrained migration prepares the legacy SupportSearch CUDA embedding worker (`legacy/encoder.py` and `legacy/runtime.json`) for a hardware trial on Google Cloud TPU using `torch_tpu` ([google-pytorch/torch_tpu](https://github.com/google-pytorch/torch_tpu), [Hugging Face Transformers Google TPU guide](https://huggingface.co/docs/transformers/main/google_tpu)). No accelerator was available in the preparation environment; these artifacts have **not** been executed on TPU or GPU hardware, and no deployment or measured numerical/performance parity is claimed.\n\n### `candidate/encoder.py`\n- **Backend registration**: Added a standalone `import torch_tpu` statement so the `tpu` device backend is registered with PyTorch at import time.\n- **Target device**: Changed `DEVICE` from `\"cuda\"` to `\"tpu\"`.\n- **Batch size**: Changed `BATCH_SIZE` from `8` to `16`.\n- **Preserved AST & behavior**: The module docstring, `MODEL_ID` (`\"sentence-transformers/all-MiniLM-L6-v2\"`), `MAX_LENGTH` (`256`), `mean_pool(hidden, attention_mask)`, `normalize_vectors(vectors)`, `encode(texts)` signature and body, tokenizer invocation (`padding=\"max_length\"`, `truncation=True`, `max_length=MAX_LENGTH`, `return_tensors=\"pt\"`), `float32` precision (via `.float()` in pooling and default `float32` weights), L2 normalization (`F.normalize(vectors, p=2, dim=1)`), and `.cpu()` transfer per batch are preserved identically without adding extra code.\n\n### `candidate/runtime.json`\n- Changed `\"device\"` from `\"cuda\"` to `\"tpu\"`.\n- Changed `\"batch_size\"` from `8` to `16`.\n- All other fields (`\"model_id\"`, `\"max_length\": 256`, `\"precision\": \"float32\"`, `\"pooling\": \"attention_mask_mean\"`, `\"normalize\": true`, `\"api_fields\": [\"query\", \"document_ids\", \"scores\"]`, and `\"hardware_validated\": false`) are unchanged.\n\n---\n\n## 2. Limitations and Unverified Assumptions\n\nBecause this migration is strictly constrained in AST structure and prepared without TPU hardware access, the following limitations and assumptions remain unverified until tested on a physical Cloud TPU host:\n\n1. **Operator Coverage & Lowering**:\n   - All operators inside `sentence-transformers/all-MiniLM-L6-v2` (BERT-based self-attention, `LayerNorm`, `GELU`, linear projections, embeddings), `mean_pool` (`unsqueeze`, `expand`, `.float()`, elementwise multiplication, `.sum(1)`, `.clamp(min=1e-9)`, division), and `normalize_vectors` (`F.normalize(..., p=2, dim=1)`) are assumed to lower cleanly through the `torch_tpu` / XLA compiler without silent CPU fallback or unsupported-op exceptions.\n2. **Per-Call Model & Tokenizer Instantiation**:\n   - Because `encode(texts)` preserves the exact legacy AST, `AutoTokenizer.from_pretrained(MODEL_ID)` and `AutoModel.from_pretrained(MODEL_ID).to(DEVICE).eval()` are called inside `encode(texts)` on every invocation, and `.cpu()` is called after each batch iteration forcing host-device synchronization per step.\n3. **Float32 Precision on TPU MXU**:\n   - The configuration preserves `\"precision\": \"float32\"` and explicit `.float()` casting in `mean_pool`. TPU Matrix Multiply Units (MXUs) natively accelerate `bfloat16` / mixed-precision formats and configurable matmul precision settings; running strict `float32` vs. default XLA matmul precision may exhibit slight numerical differences compared to CUDA `float32` (or TF32) and requires explicit numerical tolerance verification on hardware.\n4. **Hardware Validation Status**:\n   - `\"hardware_validated\"` remains `false` in `candidate/runtime.json` and must only be flipped after passing all hardware verification checks below.\n\n---\n\n## 3. Static Shapes and Partial-Batch Handling\n\n- **Sequence dimension (`MAX_LENGTH = 256`)**: The tokenizer uses `padding=\"max_length\"` and `truncation=True` with `max_length=256`, which fixes the sequence length dimension at `256` across all calls.\n- **Batch dimension (`BATCH_SIZE = 16`) and Partial Final Batch**:\n  - Full batches produce input tensors (`input_ids`, `attention_mask`, `token_type_ids`) of static shape `(16, 256)`.\n  - However, the batching loop `batch = texts[start:start + BATCH_SIZE]` slices the trailing remainder directly when `len(texts)` is not an exact multiple of `16` (i.e., `len(texts) % 16 != 0`).\n  - **XLA Recompilation Risk**: On TPU (`torch_tpu`), XLA compiles graphs specialized to exact input tensor dimensions. A trailing partial batch of size $R \\in \\{1, \\dots, 15\\}$ produces tensor shapes `(R, 256)`, triggering a new XLA graph compilation for each distinct remainder $R$ encountered in traffic (up to 15 additional compilations beyond the `(16, 256)` graph), causing latency spikes on first occurrence.\n  - **Mitigation & Operational Guidance**:\n    - Because the constrained migration prohibits altering the `encode(texts)` AST, callers or the upstream request batcher should either pad input text lists to a multiple of `16` (and slice the returned list back to `len(texts)`) or pre-warm the worker across expected batch sizes `(1..16, 256)` during startup before serving live queries.\n    - In a subsequent unconstrained iteration, `encode(texts)` can pad partial batches internally to `BATCH_SIZE = 16` with dummy inputs prior to device transfer and slice `outputs` to the unpadded count after `.cpu()`.\n\n---\n\n## 4. Model Revision and Tokenizer Pinning\n\n- **Current Risk**: `MODEL_ID = \"sentence-transformers/all-MiniLM-L6-v2\"` is resolved dynamically from the Hugging Face Hub (or local cache) without an explicit `revision=<commit_sha>` or `local_files_only=True` argument because the AST is constrained. If upstream weights, `config.json`, or tokenizer files (`tokenizer.json`, `vocab.txt`, `special_tokens_map.json`) change on the Hub, workers could produce incompatible embeddings across nodes or restarts.\n- **Pinning Procedure for the Trial**:\n  1. Pre-download and verify a specific immutable Git commit SHA of `sentence-transformers/all-MiniLM-L6-v2` into a read-only artifact image or local mount prior to starting the TPU worker.\n  2. Set environment variables on the worker host so `transformers` resolves purely from the pinned local snapshot:\n     ```bash\n     export HF_HUB_OFFLINE=1\n     export TRANSFORMERS_OFFLINE=1\n     export HF_HOME=/opt/models/hf_cache\n     ```\n  3. Record the exact model commit SHA, `transformers` version, `tokenizers` version, `torch` version, and `torch_tpu` wheel digest in the deployment manifest.\n\n---\n\n## 5. Prerequisites for the TPU Hardware Trial\n\n1. **Hardware & OS**:\n   - A provisioned Google Cloud TPU VM (e.g., TPU v5e / v5p / v6e single-chip or single-host slice) running Ubuntu 22.04/24.04 with matching `libtpu.so` driver installed and accessible TPU device nodes (`/dev/accel*` or `/dev/vfio/*`).\n2. **Software Stack**:\n   - Compatible Python (`>=3.10`), `torch`, `torch_tpu` (matching the installed PyTorch and `libtpu` release from [google-pytorch/torch_tpu](https://github.com/google-pytorch/torch_tpu)), and `transformers` ([Hugging Face Google TPU documentation](https://huggingface.co/docs/transformers/main/google_tpu)).\n3. **Model Artifacts**:\n   - Local cached copy of `sentence-transformers/all-MiniLM-L6-v2` (weights + tokenizer files) matching the pinned revision used by the CUDA baseline.\n4. **Reference Baseline Artifact**:\n   - A saved reference output file (`cuda_baseline_embeddings.pt` or `.json`) generated by running `legacy/encoder.py` on CUDA with a fixed evaluation corpus covering empty inputs (`0`), single partial batch (`1`, `7`, `15`), exact single batch (`16`), exact multiple batches (`32`), and multi-batch with remainder (`35`), plus long inputs exceeding `256` tokens to exercise truncation.\n\n---\n\n## 6. Exact Checks to Run on Real Hardware\n\nRun the following verification steps sequentially on the target TPU VM before routing any trial traffic:\n\n### Check 1: TPU Device & `torch_tpu` Backend Registration\n```bash\npython3 -c '\nimport torch\nimport torch_tpu\n\nassert hasattr(torch, \"tpu\"), \"torch.tpu namespace not registered\"\nassert torch.tpu.is_available(), \"TPU device is not available\"\nprint(\"TPU device count:\", torch.tpu.device_count())\nx = torch.ones((2, 2), device=\"tpu\", dtype=torch.float32)\nprint(\"Simple tensor op on TPU succeeded:\", (x + x).cpu().tolist())\n'\n```\n\n### Check 2: Candidate Functional Smoke & Shape/Normalization Check\n```bash\npython3 -c '\nimport math\nfrom candidate.encoder import encode, BATCH_SIZE\n\n# 1. Empty input check\nassert encode([]) == [], \"Empty input must return []\"\n\n# 2. Exact batch (16) and partial batch (19 = 16 + 3) check\ntexts = [f\"Support ticket #{i}: unable to reset account MFA token.\" for i in range(19)]\nvecs = encode(texts)\nassert len(vecs) == 19, f\"Expected 19 vectors, got {len(vecs)}\"\nassert all(len(v) == 384 for v in vecs), \"Expected 384-d embeddings for all-MiniLM-L6-v2\"\n\n# 3. Finite values and unit L2 norm check\nfor idx, v in enumerate(vecs):\n    assert all(math.isfinite(x) for x in v), f\"Non-finite value in vector {idx}\"\n    norm = math.sqrt(sum(x * x for x in v))\n    assert abs(norm - 1.0) < 1e-5, f\"Vector {idx} L2 norm {norm} deviates from 1.0\"\nprint(\"Functional smoke and L2 normalization checks passed.\")\n'\n```\n\n### Check 3: Batch-Size Invariance & Partial-Batch Consistency Check\nVerify that encoding a text inside a full batch of `16` produces the same embedding as encoding it in a partial trailing batch:\n```bash\npython3 -c '\nimport torch\nfrom candidate.encoder import encode\n\ntexts_full = [f\"Sample query {i}\" for i in range(16)]\ntexts_partial = texts_full[:5]\n\nemb_full = torch.tensor(encode(texts_full)[:5], dtype=torch.float32)\nemb_partial = torch.tensor(encode(texts_partial), dtype=torch.float32)\n\ncos_sim = torch.nn.functional.cosine_similarity(emb_full, emb_partial, dim=1)\nmax_abs_diff = (emb_full - emb_partial).abs().max().item()\nprint(\"Min cosine similarity (full vs partial):\", cos_sim.min().item())\nprint(\"Max abs diff (full vs partial):\", max_abs_diff)\nassert cos_sim.min().item() > 0.99999, \"Partial batch output diverged from full batch\"\n'\n```\n\n### Check 4: Numerical Parity Against CUDA Baseline\nCompare `candidate/encoder.py` on TPU against pre-recorded CUDA baseline embeddings on the validation corpus:\n```bash\npython3 -c '\nimport json, torch\nfrom candidate.encoder import encode\n\nwith open(\"cuda_baseline_fixture.json\", \"r\", encoding=\"utf-8\") as f:\n    fixture = json.load(f)\n\ntpu_out = torch.tensor(encode(fixture[\"texts\"]), dtype=torch.float32)\ncuda_out = torch.tensor(fixture[\"embeddings\"], dtype=torch.float32)\n\ncos_sim = torch.nn.functional.cosine_similarity(tpu_out, cuda_out, dim=1)\nmax_diff = (tpu_out - cuda_out).abs().max().item()\nprint(f\"Min cosine similarity vs CUDA: {cos_sim.min().item():.6f}\")\nprint(f\"Max absolute error vs CUDA:    {max_diff:.6e}\")\nassert cos_sim.min().item() >= 0.999, \"Cosine similarity below 0.999 threshold\"\n'\n```\n\n### Check 5: Warmup vs. Steady-State Latency & Recompilation Inspection\nMeasure initial compilation latency vs. subsequent warm invocations for `N=16` (static full batch) and `N=19` (with partial tail batch):\n```bash\npython3 -c '\nimport time\nfrom candidate.encoder import encode\n\nbatch_16 = [f\"Warmup text {i}\" for i in range(16)]\nt0 = time.perf_counter(); encode(batch_16); t_cold = time.perf_counter() - t0\nt1 = time.perf_counter(); encode(batch_16); t_warm = time.perf_counter() - t1\nprint(f\"N=16 cold_s={t_cold:.4f} warm_s={t_warm:.4f}\")\n'\n```\n\n---\n\n## 7. Rollout and Rollback Plan\n\n### Rollout Plan\n1. **Stage 1 \u2014 Offline Hardware Validation**: Run Checks 1\u20135 on a dedicated staging TPU VM. Only after all checks pass, update `\"hardware_validated\": true` in deployment metadata.\n2. **Stage 2 \u2014 Shadow / Dark-Traffic Trial**: Deploy the TPU worker behind a shadow queue receiving duplicated read-only production queries (`api_fields`: `[\"query\", \"document_ids\", \"scores\"]`). Compare TPU vs. CUDA top-$k$ retrieval overlap (Recall@10 / rank correlation) and tail latency (p50/p95/p99), watching specifically for XLA recompilation spikes on partial batches.\n3. **Stage 3 \u2014 Canary Traffic Ramp**: Route 1% $\\rightarrow$ 10% $\\rightarrow$ 50% $\\rightarrow$ 100% of stateless embedding worker traffic to the TPU worker pool while keeping the CUDA worker pool warm on standby.\n\n### Rollback Plan\n- Because `encode(texts)` signature, `MODEL_ID`, `MAX_LENGTH`, embedding dimension (`384`), normalization, and `api_fields` (`[\"query\", \"document_ids\", \"scores\"]`) are identical between `legacy/` and `candidate/`, rollback requires **zero index rebuilds or API schema changes**.\n- **Immediate Rollback Trigger Conditions**:\n  - Any unhandled XLA/TPU runtime error or device hang,\n  - Cosine similarity drift (`< 0.999` vs. CUDA baseline) or retrieval Recall@10 degradation,\n  - Unacceptable p99 latency spikes caused by partial-batch recompilation or per-call model loading.\n- **Rollback Execution**:\n  1. Shift traffic routing weight back to `100%` on the legacy CUDA worker pool (`legacy/encoder.py` + `legacy/runtime.json` with `\"device\": \"cuda\"`, `\"batch_size\": 8`).\n  2. Drain and terminate the candidate TPU worker instances, preserving XLA compile logs and failure payloads for offline diagnosis.\n"
+      },
+      "hashes": {
+        "encoder.py": "81b303d31bf3b827b09e66b01648c878c57d19186fc5eae37f01ae3caf7f6459",
+        "runtime.json": "e1dc0d43bf1bcb20333edf433573efa9ea11ce06a2753f6ff11cebf8b361bddd",
+        "migration.md": "d55f4923a334f6995303375592b7201e0763bbbfcfbb65fa25f9dbf9f3a3eeb0"
+      },
+      "checks": [
+        {
+          "name": "Runtime contract: model_id",
+          "passed": true
+        },
+        {
+          "name": "Runtime contract: device",
+          "passed": true
+        },
+        {
+          "name": "Runtime contract: batch_size",
+          "passed": true
+        },
+        {
+          "name": "Runtime contract: max_length",
+          "passed": true
+        },
+        {
+          "name": "Runtime contract: precision",
+          "passed": true
+        },
+        {
+          "name": "Runtime contract: pooling",
+          "passed": true
+        },
+        {
+          "name": "Runtime contract: normalize",
+          "passed": true
+        },
+        {
+          "name": "Runtime contract: api_fields",
+          "passed": true
+        },
+        {
+          "name": "Runtime contract: hardware_validated",
+          "passed": true
+        },
+        {
+          "name": "Python syntax parses",
+          "passed": true
+        },
+        {
+          "name": "mean_pool AST preserved",
+          "passed": true
+        },
+        {
+          "name": "normalize_vectors AST preserved",
+          "passed": true
+        },
+        {
+          "name": "Model identity preserved in code",
+          "passed": true
+        },
+        {
+          "name": "TPU device configured in code",
+          "passed": true
+        },
+        {
+          "name": "Requested batch size in code",
+          "passed": true
+        },
+        {
+          "name": "Token length preserved in code",
+          "passed": true
+        },
+        {
+          "name": "TorchTPU backend imported",
+          "passed": true
+        },
+        {
+          "name": "Only approved source transformations",
+          "passed": true
+        }
+      ],
+      "interaction": {
+        "id": "recorded-interaction-1",
+        "environment_id": "recorded-shared-workspace",
+        "redacted": true
+      }
+    }
+  ]
+}
